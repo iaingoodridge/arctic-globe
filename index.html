@@ -1,0 +1,453 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<title>Arctic Shipping — Mapbox GL Globe (fast + smooth pan)</title>
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<link href="https://api.tiles.mapbox.com/mapbox-gl-js/v2.15.0/mapbox-gl.css" rel="stylesheet" />
+<style>
+  :root{ --bg:#0b1220; --panel:#0f1420; --border:rgba(255,255,255,.12); --text:#e8eefc; }
+  html,body{height:100%;margin:0;background:var(--bg);color:var(--text);
+    font-family:system-ui,-apple-system,Segoe UI,Roboto,Inter,sans-serif; overflow:hidden}
+  #wrap{display:flex;height:100%}
+  #left,#right{position:relative;flex:1 1 50%;overflow:hidden}
+  .map{position:absolute;inset:0}
+  .label{position:absolute;top:10px;background:rgba(15,20,32,.95);
+    padding:6px 10px;border:1px solid var(--border);border-radius:10px;font-size:12px;z-index:5}
+  .label.left{left:10px}
+  .label.right{right:10px}
+
+  /* Panel */
+  #panel{position:absolute;top:12px;left:50%;transform:translateX(-50%);z-index:50;
+    background:rgba(15,20,32,.97);border:1px solid var(--border);border-radius:12px;
+    padding:12px 14px 8px 14px;box-shadow:0 6px 20px rgba(0,0,0,.35);min-width:980px;pointer-events:auto}
+  #panel.collapsed{padding:6px 10px;min-width:auto}
+  #toggle{position:absolute;left:8px;top:8px;width:18px;height:18px;border-radius:4px;border:1px solid var(--border);
+    background:#121726;color:#9fb3d1;font-weight:700;display:flex;align-items:center;justify-content:center;cursor:pointer}
+  .row{display:flex;gap:10px;align-items:center;margin:6px 0;flex-wrap:wrap}
+  .row label{font-size:12px}
+  .row input[type=number]{width:84px}
+  .hint{font-size:11px;opacity:.9}
+  .hidden{display:none}
+  .foldable{display:block}
+  #panel.collapsed .foldable, #panel.collapsed .hint, #panel.collapsed details {display:none}
+
+  details{margin-top:6px;font-size:12px}
+  details summary{cursor:pointer;user-select:none;opacity:.9}
+</style>
+</head>
+<body>
+<div id="wrap">
+  <div id="left">
+    <div id="mapL" class="map"></div>
+    <div class="label left">July 2019</div>
+  </div>
+  <div id="right">
+    <div id="mapR" class="map"></div>
+    <div class="label right">July 2025</div>
+  </div>
+</div>
+
+<div id="panel">
+  <div id="toggle" title="Collapse/expand">▾</div>
+
+  <div class="row foldable">
+    <label><input type="radio" name="mode" value="split" checked> Split (2019 vs 2025)</label>
+    <label><input type="radio" name="mode" value="diff"> Diff (2025 − 2019)</label>
+    <span style="width:10px"></span>
+    <label>Style
+      <select id="style">
+        <option value="mapbox://styles/mapbox/dark-v11">Mapbox Dark</option>
+        <option value="mapbox://styles/mapbox/light-v11" selected>Mapbox Light</option>
+        <option value="mapbox://styles/mapbox/satellite-streets-v12">Satellite Streets</option>
+      </select>
+    </label>
+    <label>Mapbox token
+      <input id="mbToken" size="54"
+        value="pk.eyJ1IjoiaWFpbmdvb2RyaWRnZSIsImEiOiJjbWVhOHN1bmYwODBlMmtvazg0d2x5cGE0In0.wNf404Lq5QdceGXbgCYXGA">
+    </label>
+  </div>
+
+  <div class="row foldable">
+    <label>Metric
+      <select id="metric">
+        <option value="vessel_count" selected>vessel_count</option>
+        <option value="msg_count">msg_count</option>
+        <option value="density">msg_count density (per km²)</option>
+      </select>
+    </label>
+    <label>Upper clamp <span id="pctVal">96</span>%</label>
+    <input type="range" id="pct" min="90" max="99.5" step="0.5" value="96">
+    <label>Color boost <span id="boostVal">0.80</span></label>
+    <input type="range" id="boost" min="0.4" max="1" step="0.05" value="0.80">
+    <label>Radius × <span id="radMulVal">1.0</span></label>
+    <input type="range" id="radMul" min="0.7" max="1.6" step="0.1" value="1.0">
+  </div>
+
+  <div class="row foldable">
+    <label>De-ring (H3) <input type="checkbox" id="useH3" checked></label>
+    <label>H3 res
+      <select id="h3res">
+        <option>3</option><option selected>4</option><option>5</option>
+      </select>
+    </label>
+    <label>Ocean-only <input type="checkbox" id="oceanOnly" checked></label>
+    <label>Min vessels <input type="number" id="minV" value="2" min="0" step="1"></label>
+    <label>Max latitude <input type="number" id="maxLat" value="85" min="70" max="85" step="0.2"></label>
+  </div>
+
+  <div class="row foldable hidden" id="diffRow">
+    <label>Diff metric
+      <select id="diffMetric">
+        <option value="pct" selected>Percent ((2025−2019)/2019)</option>
+        <option value="abs">Absolute</option>
+      </select>
+    </label>
+    <label>Diff max % <input type="number" id="diffMaxPct" value="120"></label>
+    <label>Diff max abs <input type="number" id="diffMaxAbs" value="1500"></label>
+  </div>
+
+  <div class="hint foldable">
+    Opaque dots • no sorting • ocean flag precomputed (no <code>within()</code>) • rAF-throttled camera sync • sampling at low zoom • auto H3 by zoom.
+  </div>
+
+  <details class="foldable">
+    <summary>About the data</summary>
+    <p>Each CSV contains AIS message aggregates for a July month (2019 / 2025), filtered to high latitudes and binned to a 0.5° grid. For each grid cell we store <i>msg_count</i> and <i>vessel_count</i> (distinct MMSI). In the app we can also show a per-km² density. Exported files are named <b>july_2019.csv</b> and <b>july_2025.csv</b>.</p>
+  </details>
+</div>
+
+<script src="https://api.tiles.mapbox.com/mapbox-gl-js/v2.15.0/mapbox-gl.js"></script>
+<script src="https://d3js.org/d3.v7.min.js"></script>
+<script src="https://unpkg.com/h3-js@4.1.0/dist/h3-js.umd.js"></script>
+<script src="https://unpkg.com/topojson-client@3"></script>
+<script src="https://unpkg.com/@turf/turf@6/turf.min.js"></script>
+
+<script>
+/* ===== helpers/state ===== */
+const $ = s => document.querySelector(s);
+const $$ = s => Array.from(document.querySelectorAll(s));
+let data2019=null, data2025=null;
+const h3cache={y2019:{}, y2025:{}};
+let landFC=null;
+window.__vals=[]; window.__upper=1;
+
+const EMPTY_FC={type:'FeatureCollection',features:[]};
+
+/* ===== collapsible panel ===== */
+const toggle=document.getElementById('toggle');
+toggle.addEventListener('click', ()=>{
+  const p=document.getElementById('panel');
+  const now=p.classList.toggle('collapsed');
+  toggle.textContent = now ? '▸' : '▾';
+});
+
+/* ===== UI ===== */
+function raf(fn){ cancelAnimationFrame(raf._id); raf._id=requestAnimationFrame(fn); }
+['pct','boost','radMul'].forEach(id=>{
+  $('#'+id).addEventListener('input', ()=>{
+    if(id==='pct')   $('#pctVal').textContent=$('#pct').value;
+    if(id==='boost') $('#boostVal').textContent=$('#boost').value;
+    if(id==='radMul')$('#radMulVal').textContent=$('#radMul').value;
+    recomputeUpper(); updatePaint();
+  });
+});
+['metric','h3res','useH3','minV','diffMetric','diffMaxPct','diffMaxAbs'].forEach(id=>{
+  $('#'+id).addEventListener('change', ()=> raf(renderData));
+});
+['oceanOnly','maxLat'].forEach(id=>{
+  $('#'+id).addEventListener('change', applyFilters);
+});
+$$('input[name=mode]').forEach(r=>{
+  r.addEventListener('change', ()=>{
+    const mode = $$('input[name=mode]').find(x=>x.checked).value;
+    $('#diffRow').classList.toggle('hidden', mode!=='diff');
+    (mode==='diff') ? enterDiff() : exitDiff();
+    raf(renderData);
+  });
+});
+$('#style').addEventListener('change', ()=>{ mapL.setStyle($('#style').value); mapR.setStyle($('#style').value); });
+
+/* ===== Mapbox setup (smooth pan) ===== */
+mapboxgl.accessToken=$('#mbToken').value.trim();
+const arctic={center:[0,85],zoom:1.2,pitch:0,bearing:0,projection:'globe'};
+const common={fadeDuration:0,crossSourceCollisions:false,antialias:true,dragRotate:false,interactive:true};
+const mapL=new mapboxgl.Map({container:'mapL',style:$('#style').value,...arctic,...common});
+const mapR=new mapboxgl.Map({container:'mapR',style:$('#style').value,...arctic,...common});
+mapL.touchZoomRotate.disableRotation();
+mapR.touchZoomRotate.disableRotation();
+mapL.keyboard.disable(); mapR.keyboard.disable();
+
+let activeDriver='L';
+mapL.on('dragstart', ()=> activeDriver='L');
+mapR.on('dragstart', ()=> activeDriver='R');
+
+/* rAF-throttled, one-way sync */
+function syncSmooth(from,to,who){
+  let syncing=false, pend=false;
+  function pump(){
+    pend=false; syncing=true;
+    to.jumpTo({center:from.getCenter(), zoom:from.getZoom(), bearing:from.getBearing(), pitch:from.getPitch()});
+    syncing=false;
+  }
+  from.on('move', ()=>{
+    if(syncing) return;
+    if((who==='L' && activeDriver!=='L') || (who==='R' && activeDriver!=='R')) return;
+    if(!pend){ pend=true; requestAnimationFrame(pump); }
+  });
+}
+syncSmooth(mapL,mapR,'L');
+syncSmooth(mapR,mapL,'R');
+
+mapL.on('load',()=>{ mapL.setFog({range:[0.8,10],color:"#0b1220"}); installLayers(mapL,'L'); fetchLand(); raf(renderData); });
+mapR.on('load',()=>{ mapR.setFog({range:[0.8,10],color:"#0b1220"}); installLayers(mapR,'R'); applyFilters(); raf(renderData); });
+mapL.on('styledata',()=>installLayers(mapL,'L'));
+mapR.on('styledata',()=>installLayers(mapR,'R'));
+
+/* Auto H3 res */
+function resForZoom(z){ return (z<1.3)?3 : (z<1.9)?4 : 5; }
+mapL.on('zoomend', ()=>{ const r=resForZoom(mapL.getZoom()); const sel=$('#h3res'); if(+sel.value!==r){ sel.value=r; invalidate(); raf(renderData); } });
+
+/* ===== Land polygons for ocean flag ===== */
+async function fetchLand(){
+  try{
+    const r=await fetch('https://unpkg.com/world-atlas@2/land-110m.json');
+    const topo=await r.json();
+    landFC = topojson.feature(topo, topo.objects.land);
+    applyFilters();
+  }catch(e){ console.warn('land load failed', e); }
+}
+
+/* ===== Paint (opaque) ===== */
+function buildPaint(baseRGB, mode){
+  const rmin=1.2, rmax=6.2;
+  const upper = Math.max(1, window.__upper||1);
+  const radMul= +$('#radMul').value;
+  const boost = +$('#boost').value;
+  const denom = Math.max(1e-6, Math.sqrt(Math.log(1+upper)));
+
+  const radius = [
+    'min',
+    ['*',
+      ['+',
+        rmin,
+        ['*', (rmax - rmin),
+          ['/', ['sqrt', ['ln', ['+', 1, ['min', ['to-number',['get','v']], upper]]]], denom]
+        ]
+      ],
+      radMul
+    ],
+    rmax
+  ];
+
+  const tFactor = ['+', boost, ['*', (1-boost),
+                    ['sqrt', ['/', ['min',['to-number',['get','v']], upper], Math.max(1e-6, upper) ] ] ] ];
+
+  const colorSplit = ['rgba',
+    ['round',['*', baseRGB[0], tFactor]],
+    ['round',['*', baseRGB[1], tFactor]],
+    ['round',['*', baseRGB[2], tFactor]],
+    1
+  ];
+
+  const colorDiff = ['case',
+    ['>', ['to-number',['get','s']],  0.5], ['rgba',255,120, 90,1],
+    ['<', ['to-number',['get','s']], -0.5], ['rgba', 93,183,255,1],
+    ['rgba',210,214,221,1]
+  ];
+
+  return {
+    'circle-radius': radius,
+    'circle-color' : (mode==='diff' ? colorDiff : colorSplit),
+    'circle-opacity': 1,
+    'circle-stroke-width': 0
+  };
+}
+
+function installLayers(map,sfx){
+  const add=(id,base,mode)=>{ if(map.getSource(id+sfx)) return;
+    map.addSource(id+sfx,{type:'geojson', data:EMPTY_FC});
+    map.addLayer({ id:id+sfx, type:'circle', source:id+sfx, paint: buildPaint(base,mode) });
+  };
+  add('pts2019',[93,183,255],'split');
+  add('pts2025',[255,120,90],'split');
+  add('diffpts',[210,214,221],'diff');
+}
+
+function updatePaint(){
+  [['L',mapL],['R',mapR]].forEach(([sfx,m])=>{
+    const set=(id,base,mode)=>{ if(m.getLayer(id+sfx)){ const p=buildPaint(base,mode);
+      m.setPaintProperty(id+sfx,'circle-radius',p['circle-radius']);
+      m.setPaintProperty(id+sfx,'circle-color', p['circle-color']); } };
+    set('pts2019',[93,183,255],'split');
+    set('pts2025',[255,120,90],'split');
+    set('diffpts',[210,214,221],'diff');
+  });
+}
+
+/* ===== Quantile ===== */
+function recomputeUpper(){
+  const clamp=+$('#pct').value;
+  const arr=window.__vals||[];
+  if(!arr.length){ window.__upper=1; return; }
+  const s=arr.slice().sort((a,b)=>a-b);
+  const q=Math.min(0.999, Math.max(0.5, clamp/100));
+  const k=Math.max(0, Math.floor((s.length-1)*q));
+  window.__upper = Math.max(1, s[k]);
+}
+
+/* ===== CSV loader ===== */
+async function loadCsv(path){
+  const res=await fetch(encodeURI(path));
+  if(!res.ok) throw new Error(path+' '+res.status);
+  const rows=await d3.csv(path);
+  const cols=rows.columns||Object.keys(rows[0]||{});
+  const pick=(...n)=>n.find(x=>cols.includes(x));
+  const lat=pick('latitude','lat','Latitude','LAT');
+  const lon=pick('longitude','lon','Longitude','LON','Lng','lng');
+  const msg=pick('msg_count','messages','recent_count','hist_count','count','msgcount');
+  const ves=pick('vessel_count','vessels','vessel_count_recent','unique_vessels');
+  if(!lat||!lon) throw new Error('No lat/lon');
+  return rows.map(r=>({latitude:+r[lat], longitude:+r[lon], msg_count: msg?+r[msg]:1, vessel_count: ves?+r[ves]: (msg?+r[msg]:1)}))
+             .filter(d=>Number.isFinite(d.latitude)&&Number.isFinite(d.longitude));
+}
+
+/* ===== H3 aggregation (ocean flag 'o') ===== */
+function invalidate(){ h3cache.y2019={}; h3cache.y2025={}; }
+
+function pointOnLand(lon, lat){
+  if(!landFC) return false;
+  if (Math.abs(lat) > 82) return false; // skip near pole ring
+  const pt = turf.point([lon,lat]);
+  return landFC.features.some(f => turf.booleanPointInPolygon(pt, f));
+}
+
+function aggH3(rows, metric, res, minV){
+  const mp=new Map();
+  for(const r of rows){
+    const idx=h3.latLngToCell(r.latitude,r.longitude,res);
+    const cur=mp.get(idx)||{idx,msg:0,ves:0};
+    cur.msg+=(r.msg_count||0); cur.ves+=(r.vessel_count||0);
+    mp.set(idx,cur);
+  }
+  const out=[];
+  for(const v of mp.values()){
+    const [lat,lon]=h3.cellToLatLng(v.idx);
+    const area=h3.cellArea(v.idx,'km2');
+    const dens= area>0 ? (v.msg/area) : 0;
+    const val = metric==='density'? dens : (metric==='msg_count'?v.msg:v.ves);
+    if(v.ves < minV) continue;
+    const onLand = pointOnLand(lon,lat);
+    out.push({latitude:lat, longitude:lon, v:val, msg_count:v.msg, vessel_count:v.ves, o: onLand ? 1 : 0});
+  }
+  return out;
+}
+function getAgg(which, metric, res, minV){
+  const key=`${metric}_${res}_${minV}`;
+  if(!h3cache[which][key]){
+    const src=(which==='y2019'?data2019:data2025);
+    h3cache[which][key]=aggH3(src,metric,res,minV);
+  }
+  return h3cache[which][key];
+}
+
+/* ===== Sampling for speed ===== */
+function sampleArray(arr, maxN){
+  if(arr.length<=maxN) return arr;
+  const step=Math.ceil(arr.length/maxN); const out=[];
+  for(let i=0;i<arr.length;i+=step) out.push(arr[i]);
+  return out;
+}
+
+/* ===== Cheap property filters ===== */
+function applyFilters(){
+  const maxLat = +$('#maxLat').value;
+  const oceanOnly = $('#oceanOnly').checked;
+  const latFilter   = ['<=', ['abs',['get','lat']], maxLat];
+  const oceanFilter = oceanOnly ? ['==', ['get','o'], 0] : true;
+
+  [['L',mapL],['R',mapR]].forEach(([sfx,m])=>{
+    ['pts2019'+sfx,'pts2025'+sfx,'diffpts'+sfx].forEach(id=>{
+      if(m.getLayer(id)) m.setFilter(id, ['all', latFilter, oceanFilter]);
+    });
+  });
+}
+
+/* ===== Data render ===== */
+function renderData(){
+  if(!data2019||!data2025||!mapL.isStyleLoaded()||!mapR.isStyleLoaded()) return;
+
+  const mode = $$('input[name=mode]').find(x=>x.checked).value;
+  const metric=$('#metric').value;
+  const res=+$('#h3res').value;
+  const useH3=$('#useH3').checked;
+  const minV=+$('#minV').value;
+
+  let A = useH3 ? getAgg('y2019',metric,res,minV) : data2019.filter(d=>d.vessel_count>=minV).map(d=>({latitude:d.latitude,longitude:d.longitude,v:(metric==='msg_count'?d.msg_count:(metric==='vessel_count'?d.vessel_count:d.msg_count)),o: pointOnLand(d.longitude,d.latitude)?1:0}));
+  let B = useH3 ? getAgg('y2025',metric,res,minV) : data2025.filter(d=>d.vessel_count>=minV).map(d=>({latitude:d.latitude,longitude:d.longitude,v:(metric==='msg_count'?d.msg_count:(metric==='vessel_count'?d.vessel_count:d.msg_count)),o: pointOnLand(d.longitude,d.latitude)?1:0}));
+
+  const MAX_POINTS = 18000;
+  A = sampleArray(A, MAX_POINTS);
+  B = sampleArray(B, MAX_POINTS);
+
+  window.__vals = A.map(d=>d.v).concat(B.map(d=>d.v));
+  recomputeUpper();
+
+  const toFC = arr => ({type:'FeatureCollection',features:arr.map(d=>({
+    type:'Feature',
+    geometry:{type:'Point',coordinates:[d.longitude,d.latitude]},
+    properties:{ v: d.v, lat: d.latitude, o: d.o }
+  }))});
+
+  if(mode==='split'){
+    // update both maps, clear diff
+    const s19=mapL.getSource('pts2019L'), s25=mapR.getSource('pts2025R'), sd=mapR.getSource('diffptsR');
+    if(s19) s19.setData(toFC(A));
+    if(s25) s25.setData(toFC(B));
+    if(sd)  sd.setData(EMPTY_FC);
+    applyFilters();
+  } else {
+    // compute diff on right, clear split layers to avoid stale points
+    const diffMode=$('#diffMetric').value;
+    const keyOf = d => `${d.latitude.toFixed(4)},${d.longitude.toFixed(4)}`;
+    const m=new Map(A.map(d=>[keyOf(d), d]));
+    const feats=[];
+    for(const d of B){
+      const k=keyOf(d);
+      const a = m.get(k);
+      const v2 = d.v;
+      const v1 = a ? a.v : 0;
+      const diff = diffMode==='pct' ? (v1>0? (v2-v1)/v1*100 : (v2>0?100:0)) : (v2-v1);
+      feats.push({type:'Feature',geometry:{type:'Point',coordinates:[d.longitude,d.latitude]},properties:{v:Math.abs(diff), s: Math.sign(diff), lat:d.latitude, o:d.o}});
+      m.delete(k);
+    }
+    for(const [k,a] of m){
+      const [lat,lon]=k.split(',').map(Number);
+      const diff = diffMode==='pct' ? -100 : -a.v;
+      feats.push({type:'Feature',geometry:{type:'Point',coordinates:[lon,lat]},properties:{v:Math.abs(diff), s:-1, lat, o:a.o}});
+    }
+    const g={type:'FeatureCollection',features:feats};
+    const sd=mapR.getSource('diffptsR'), s19=mapL.getSource('pts2019L'), s25=mapR.getSource('pts2025R');
+    if(sd)  sd.setData(g);
+    if(s19) s19.setData(EMPTY_FC);
+    if(s25) s25.setData(EMPTY_FC);
+    applyFilters();
+  }
+
+  updatePaint();
+}
+
+/* Diff mode: hide left map DOM (keeps sync simple) */
+function enterDiff(){ $('#left').style.display='none'; activeDriver='R'; }
+function exitDiff(){  $('#left').style.display=''; activeDriver='L'; }
+
+/* ===== Boot ===== */
+(async()=>{
+  try{
+    [data2019,data2025] = await Promise.all([loadCsv('july_2019.csv'), loadCsv('july_2025.csv')]);
+    renderData();
+  }catch(e){ alert('CSV load error: '+e.message); }
+})();
+</script>
+</body>
+</html>
